@@ -60,13 +60,18 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         let deviceID: AudioDeviceID
         let input: Bool
     }
-    private var controlReadability: [ControlReadbackKey: (volume: Bool, mute: Bool)] = [:]
+    private var controlReadability: [ControlReadbackKey: (volume: Bool, mute: Bool, backend: VolumeControlTier)] = [:]
+    private let hardwareVolumeAvailable: @MainActor (AudioDeviceID) -> Bool
+    private let hardwareReadability: @MainActor (AudioDeviceID, Bool) -> (volume: Bool, mute: Bool)
 
     /// Cached values only; helper fallbacks (unity/false for unsupported HAL properties)
     /// are not readback. In particular, a pending DDC probe is not 50% volume.
     func controlReadback(for deviceID: AudioDeviceID, input: Bool) -> (volume: Float?, muted: Bool?, source: String?) {
+        guard let readable = controlReadability[ControlReadbackKey(deviceID: deviceID, input: input)] else {
+            return (nil, nil, nil)
+        }
         if !input {
-            let backend = outputVolumeBackend(for: deviceID)
+            let backend = readable.backend
             if backend == .software { return (volumes[deviceID], muteStates[deviceID], "software") }
             #if !APP_STORE
             if backend == .ddc {
@@ -75,13 +80,18 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
             }
             #endif
         }
-        let readable = controlReadability[ControlReadbackKey(deviceID: deviceID, input: input)]
-        let volume = readable?.volume == true ? (input ? inputVolumes[deviceID] : volumes[deviceID]) : nil
-        let muted = readable?.mute == true ? (input ? inputMuteStates[deviceID] : muteStates[deviceID]) : nil
+        let volume = readable.volume ? (input ? inputVolumes[deviceID] : volumes[deviceID]) : nil
+        let muted = readable.mute ? (input ? inputMuteStates[deviceID] : muteStates[deviceID]) : nil
         return (volume, muted, volume == nil && muted == nil ? nil : "hardware")
     }
 
-    private func refreshControlReadability(for deviceID: AudioDeviceID, input: Bool) {
+    func refreshControlReadability(for deviceID: AudioDeviceID, input: Bool, backend: VolumeControlTier? = nil) {
+        let selected = backend ?? (input ? .hardware : outputVolumeBackend(for: deviceID))
+        let readable = selected == .hardware ? hardwareReadability(deviceID, input) : (volume: false, mute: false)
+        controlReadability[ControlReadbackKey(deviceID: deviceID, input: input)] = (readable.volume, readable.mute, selected)
+    }
+
+    static func readControlHardwareMetadata(_ deviceID: AudioDeviceID, _ input: Bool) -> (volume: Bool, mute: Bool) {
         let scope = input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput
         func readable(_ selector: AudioObjectPropertySelector, element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain) -> Bool {
             var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
@@ -90,7 +100,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
             var size = UInt32(MemoryLayout<UInt32>.size)
             return AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr
         }
-        controlReadability[ControlReadbackKey(deviceID: deviceID, input: input)] = (
+        return (
             volume: readable(kAudioHardwareServiceDeviceProperty_VirtualMainVolume) ||
                 readable(kAudioDevicePropertyVolumeScalar) || readable(kAudioDevicePropertyVolumeScalar, element: 1),
             mute: readable(kAudioDevicePropertyMute)
@@ -185,15 +195,27 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     )
 
     #if !APP_STORE
-    init(deviceMonitor: AudioDeviceMonitor, settingsManager: SettingsManager, ddcController: DDCController? = nil) {
+    init(
+        deviceMonitor: AudioDeviceMonitor, settingsManager: SettingsManager, ddcController: DDCController? = nil,
+        hardwareVolumeAvailable: @escaping @MainActor (AudioDeviceID) -> Bool = { $0.hasOutputVolumeControl() },
+        hardwareReadability: @escaping @MainActor (AudioDeviceID, Bool) -> (volume: Bool, mute: Bool) = DeviceVolumeMonitor.readControlHardwareMetadata
+    ) {
         self.deviceMonitor = deviceMonitor
         self.settingsManager = settingsManager
         self.ddcController = ddcController
+        self.hardwareVolumeAvailable = hardwareVolumeAvailable
+        self.hardwareReadability = hardwareReadability
     }
     #else
-    init(deviceMonitor: AudioDeviceMonitor, settingsManager: SettingsManager) {
+    init(
+        deviceMonitor: AudioDeviceMonitor, settingsManager: SettingsManager,
+        hardwareVolumeAvailable: @escaping @MainActor (AudioDeviceID) -> Bool = { $0.hasOutputVolumeControl() },
+        hardwareReadability: @escaping @MainActor (AudioDeviceID, Bool) -> (volume: Bool, mute: Bool) = DeviceVolumeMonitor.readControlHardwareMetadata
+    ) {
         self.deviceMonitor = deviceMonitor
         self.settingsManager = settingsManager
+        self.hardwareVolumeAvailable = hardwareVolumeAvailable
+        self.hardwareReadability = hardwareReadability
     }
     #endif
 
@@ -214,7 +236,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     }
 
     private func autoDetectBackend(for deviceID: AudioDeviceID) -> VolumeControlTier {
-        if deviceID.hasOutputVolumeControl() {
+        if hardwareVolumeAvailable(deviceID) {
             return .hardware
         }
 
@@ -1006,6 +1028,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
 
         let backend = outputVolumeBackend(for: deviceID)
 
+        refreshControlReadability(for: deviceID, input: false, backend: backend)
         if backend == .software {
             let muted = settingsManager.getSoftwareDeviceMuteState(for: device.uid)
             let defaultVolume: Float = muted ? 0 : 1.0
@@ -1029,7 +1052,6 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         #endif
 
         let volume = clampedVolume(deviceID.readOutputVolumeScalar())
-        refreshControlReadability(for: deviceID, input: false)
         volumes[deviceID] = volume
 
         let muted = deviceID.readMuteState()
