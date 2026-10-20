@@ -56,6 +56,47 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     /// The current default input device UID (cached to avoid redundant Core Audio calls)
     private(set) var defaultInputDeviceUID: String?
 
+    private struct ControlReadbackKey: Hashable {
+        let deviceID: AudioDeviceID
+        let input: Bool
+    }
+    private var controlReadability: [ControlReadbackKey: (volume: Bool, mute: Bool)] = [:]
+
+    /// Cached values only; helper fallbacks (unity/false for unsupported HAL properties)
+    /// are not readback. In particular, a pending DDC probe is not 50% volume.
+    func controlReadback(for deviceID: AudioDeviceID, input: Bool) -> (volume: Float?, muted: Bool?, source: String?) {
+        if !input {
+            let backend = outputVolumeBackend(for: deviceID)
+            if backend == .software { return (volumes[deviceID], muteStates[deviceID], "software") }
+            #if !APP_STORE
+            if backend == .ddc {
+                let volume = ddcController?.getVolume(for: deviceID).map { Float($0) / 100 }
+                return (volume, muteStates[deviceID], volume == nil ? nil : "ddc")
+            }
+            #endif
+        }
+        let readable = controlReadability[ControlReadbackKey(deviceID: deviceID, input: input)]
+        let volume = readable?.volume == true ? (input ? inputVolumes[deviceID] : volumes[deviceID]) : nil
+        let muted = readable?.mute == true ? (input ? inputMuteStates[deviceID] : muteStates[deviceID]) : nil
+        return (volume, muted, volume == nil && muted == nil ? nil : "hardware")
+    }
+
+    private func refreshControlReadability(for deviceID: AudioDeviceID, input: Bool) {
+        let scope = input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput
+        func readable(_ selector: AudioObjectPropertySelector, element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain) -> Bool {
+            var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
+            guard AudioObjectHasProperty(deviceID, &address) else { return false }
+            var value: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            return AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr
+        }
+        controlReadability[ControlReadbackKey(deviceID: deviceID, input: input)] = (
+            volume: readable(kAudioHardwareServiceDeviceProperty_VirtualMainVolume) ||
+                readable(kAudioDevicePropertyVolumeScalar) || readable(kAudioDevicePropertyVolumeScalar, element: 1),
+            mute: readable(kAudioDevicePropertyMute)
+        )
+    }
+
     /// Called when any input device's volume changes (deviceID, newVolume)
     var onInputVolumeChanged: ((AudioDeviceID, Float) -> Void)?
 
@@ -332,6 +373,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         cancelAllVolumeLogTasks()
 
         volumes.removeAll()
+        controlReadability.removeAll()
         muteStates.removeAll()
         systemDeviceID = .unknown
         systemDeviceUID = nil
@@ -770,6 +812,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         for deviceID in staleVolumeIDs {
             removeVolumeListener(for: deviceID)
             volumes.removeValue(forKey: deviceID)
+            controlReadability.removeValue(forKey: ControlReadbackKey(deviceID: deviceID, input: false))
             cancelBluetoothOutputConfirmation(for: deviceID)
         }
 
@@ -879,6 +922,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         #endif
 
         let newVolume = clampedVolume(deviceID.readOutputVolumeScalar())
+        refreshControlReadability(for: deviceID, input: false)
 
         // Deduplicate: HAL often fires L/R channel notifications for the same volume value.
         // Both values come from the same CoreAudio API (not computed), so == is safe for Float32.
@@ -938,6 +982,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         guard deviceID.isValid else { return }
         if outputVolumeBackend(for: deviceID) == .software { return }
         let newMuteState = deviceID.readMuteState()
+        refreshControlReadability(for: deviceID, input: false)
         muteStates[deviceID] = newMuteState
         onMuteChanged?(deviceID, newMuteState)
         logger.debug("Mute changed for device \(deviceID): \(newMuteState)")
@@ -984,6 +1029,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         #endif
 
         let volume = clampedVolume(deviceID.readOutputVolumeScalar())
+        refreshControlReadability(for: deviceID, input: false)
         volumes[deviceID] = volume
 
         let muted = deviceID.readMuteState()
@@ -1106,6 +1152,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         for deviceID in staleVolumeIDs {
             removeInputVolumeListener(for: deviceID)
             inputVolumes.removeValue(forKey: deviceID)
+            controlReadability.removeValue(forKey: ControlReadbackKey(deviceID: deviceID, input: true))
             cancelBluetoothInputConfirmation(for: deviceID)
         }
 
@@ -1158,6 +1205,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     private func handleInputVolumeChanged(for deviceID: AudioDeviceID) {
         guard deviceID.isValid else { return }
         let newVolume = deviceID.readInputVolumeScalar()
+        refreshControlReadability(for: deviceID, input: true)
 
         // Deduplicate: same logic as output volume
         if let currentVolume = inputVolumes[deviceID], currentVolume == newVolume { return }
@@ -1206,6 +1254,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     private func handleInputMuteChanged(for deviceID: AudioDeviceID) {
         guard deviceID.isValid else { return }
         let newMuteState = deviceID.readInputMuteState()
+        refreshControlReadability(for: deviceID, input: true)
         inputMuteStates[deviceID] = newMuteState
         onInputMuteChanged?(deviceID, newMuteState)
         logger.debug("Input mute changed for device \(deviceID): \(newMuteState)")
@@ -1218,6 +1267,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
             guard device.id.isDeviceAlive() else { continue }
 
             let volume = device.id.readInputVolumeScalar()
+            refreshControlReadability(for: device.id, input: true)
             inputVolumes[device.id] = volume
 
             let muted = device.id.readInputMuteState()
@@ -1263,6 +1313,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
             try? await Task.sleep(for: .milliseconds(300))
             guard let self, !Task.isCancelled, self.volumes.keys.contains(deviceID) else { return }
             let confirmedVolume = self.clampedVolume(deviceID.readOutputVolumeScalar())
+            self.refreshControlReadability(for: deviceID, input: false)
             let confirmedMute = deviceID.readMuteState()
             self.volumes[deviceID] = confirmedVolume
             self.muteStates[deviceID] = confirmedMute
@@ -1284,6 +1335,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
             try? await Task.sleep(for: .milliseconds(300))
             guard let self, !Task.isCancelled, self.inputVolumes.keys.contains(deviceID) else { return }
             let confirmedVolume = deviceID.readInputVolumeScalar()
+            self.refreshControlReadability(for: deviceID, input: true)
             let confirmedMute = deviceID.readInputMuteState()
             self.inputVolumes[deviceID] = confirmedVolume
             self.inputMuteStates[deviceID] = confirmedMute
