@@ -11,7 +11,8 @@ final class ControlService {
     private let engine: any ControlEngine
     private let settings: SettingsManager?
     private let server: UnixSocketServer
-    private let send: @MainActor (Data, UUID) -> Void
+    private let send: @MainActor (Data, UUID, @escaping @MainActor () -> Void) -> Void
+    private let onReady: @MainActor () -> Void
     private let disconnect: @MainActor (UUID) -> Void
     private let schedule: @MainActor (@escaping @MainActor () -> Void) -> Task<Void, Never>
     private var clients: [UUID: Set<String>] = [:]
@@ -26,8 +27,9 @@ final class ControlService {
         engine: any ControlEngine,
         settings: SettingsManager? = nil,
         server: UnixSocketServer = UnixSocketServer(),
-        send: (@MainActor (Data, UUID) -> Void)? = nil,
+        send: (@MainActor (Data, UUID, @escaping @MainActor () -> Void) -> Void)? = nil,
         disconnect: (@MainActor (UUID) -> Void)? = nil,
+        onReady: @escaping @MainActor () -> Void = {},
         schedule: @escaping @MainActor (@escaping @MainActor () -> Void) -> Task<Void, Never> = { action in
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(40))
@@ -39,7 +41,10 @@ final class ControlService {
         self.engine = engine
         self.settings = settings
         self.server = server
-        self.send = send ?? { server.send($0, to: $1) }
+        self.send = send ?? { data, id, completed in
+            server.send(data, to: id) { DispatchQueue.main.async { completed() } }
+        }
+        self.onReady = onReady
         self.disconnect = disconnect ?? { server.disconnect($0) }
         self.schedule = schedule
     }
@@ -89,6 +94,11 @@ final class ControlService {
                 guard let self, self.sessionID == session else { return }
                 self.stopListener()
                 self.startupFailure = message
+            }
+        }, onReady: { [weak self] in
+            DispatchQueue.main.async {
+                guard let self, self.running, self.sessionID == session else { return }
+                self.onReady()
             }
         })
     }
@@ -162,11 +172,11 @@ final class ControlService {
                 respond(request.id, result: .object(["accepted": .bool(true)]), to: id)
             }
         } catch let failure as ControlFailure {
-            enqueue(.object(["type": .string("response"), "id": .string(request.id), "error": failure.json]), to: id)
+            enqueue(.object(["type": .string("response"), "id": .string(request.id), "error": failure.json]), to: id, requestID: request.id)
         } catch {
             logger.error("External controller command failed: \(error.localizedDescription)")
             let failure = ControlFailure(code: "internalError", message: "Unable to execute command")
-            enqueue(.object(["type": .string("response"), "id": .string(request.id), "error": failure.json]), to: id)
+            enqueue(.object(["type": .string("response"), "id": .string(request.id), "error": failure.json]), to: id, requestID: request.id)
         }
     }
 
@@ -195,10 +205,12 @@ final class ControlService {
     }
 
     private func respond(_ requestID: String, result: ControlJSON, to id: UUID) {
-        enqueue(.object(["type": .string("response"), "id": .string(requestID), "result": result]), to: id)
+        enqueue(.object(["type": .string("response"), "id": .string(requestID), "result": result]), to: id, requestID: requestID)
     }
 
-    private func enqueue(_ value: ControlJSON, to id: UUID) {
+    var pendingRequestCount: Int { clients.values.reduce(0) { $0 + $1.count } }
+
+    private func enqueue(_ value: ControlJSON, to id: UUID, requestID: String? = nil) {
         do {
             let data = try JSONEncoder().encode(value)
             guard data.count <= UnixSocketServer.maximumFrameBytes else {
@@ -206,7 +218,11 @@ final class ControlService {
                 close(id)
                 return
             }
-            send(data, id)
+            let session = sessionID
+            send(data, id) { [weak self] in
+                guard let self, self.sessionID == session, let requestID else { return }
+                self.clients[id]?.remove(requestID)
+            }
         } catch {
             logger.error("Cannot encode external controller snapshot: \(error.localizedDescription)")
             close(id)

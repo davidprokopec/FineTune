@@ -1,5 +1,6 @@
 import XCTest
 import Observation
+import Darwin
 @testable import FineTune
 
 @Observable
@@ -22,10 +23,18 @@ private final class ControlServiceFixture {
     var messages: [UUID: [ControlJSON]] = [:]
     var closed: [UUID] = []
     var scheduled: [@MainActor () -> Void] = []
+    var holdResponses = false
+    var sent: [@MainActor () -> Void] = []
     lazy var service = ControlService(
         engine: engine,
-        send: { [weak self] data, id in
-            do { self?.messages[id, default: []].append(try JSONDecoder().decode(ControlJSON.self, from: data)) }
+        send: { [weak self] data, id, completed in
+            do {
+                let value = try JSONDecoder().decode(ControlJSON.self, from: data)
+                self?.messages[id, default: []].append(value)
+                if self?.holdResponses == true, value.object?["type"] == .string("response") {
+                    self?.sent.append(completed)
+                } else { completed() }
+            }
             catch { XCTFail("Invalid outbound JSON: \(error)") }
         },
         disconnect: { [weak self] in self?.closed.append($0) },
@@ -123,7 +132,7 @@ nonisolated final class ControlServiceTests: XCTestCase {
     }
 
     @MainActor
-    func testErrorsAndDuplicateIDDisconnect() throws {
+    func testErrorsAndCompletedIDReuse() throws {
         let f = ControlServiceFixture()
         let id = f.connect()
         defer { f.service.stop() }
@@ -139,7 +148,29 @@ nonisolated final class ControlServiceTests: XCTestCase {
         try f.request("setAppMute", id: "params", client: id)
         XCTAssertEqual(f.messages[id]?.last?.object?["error"]?.object?["code"], .string("invalidParams"))
         try f.request("getState", id: "1", client: id)
+        XCTAssertTrue(f.closed.isEmpty)
+        XCTAssertNotNil(f.messages[id]?.last?.object?["result"])
+        XCTAssertEqual(f.service.pendingRequestCount, 0)
+    }
+
+    @MainActor
+    func testDuplicateInFlightIDDisconnectsAndCompletedHistoryDoesNotGrow() throws {
+        let f = ControlServiceFixture()
+        let id = f.connect()
+        defer { f.service.stop() }
+        for index in 0..<10_000 {
+            try f.request("getState", id: String(index), client: id)
+            XCTAssertEqual(f.service.pendingRequestCount, 0)
+            f.messages[id]?.removeAll()
+        }
+        f.holdResponses = true
+        try f.request("getState", id: "held", client: id)
+        XCTAssertEqual(f.service.pendingRequestCount, 1)
+        try f.request("getState", id: "held", client: id)
         XCTAssertEqual(f.closed, [id])
+        XCTAssertEqual(f.service.pendingRequestCount, 0)
+        for completed in f.sent { completed() }
+        XCTAssertEqual(f.service.pendingRequestCount, 0)
     }
 
     @MainActor
@@ -163,25 +194,89 @@ nonisolated final class ControlServiceTests: XCTestCase {
         let settings = SettingsManager(directory: root)
         let directory = root.appendingPathComponent("FineTune/Control")
         let server = UnixSocketServer(directory: directory)
-        let service = ControlService(engine: FakeControlEngine(), settings: settings, server: server)
+        let firstReady = expectation(description: "First listener ready")
+        let secondReady = expectation(description: "Second listener ready")
+        var starts = 0
+        let service = ControlService(engine: FakeControlEngine(), settings: settings, server: server, onReady: {
+            starts += 1
+            if starts == 1 { firstReady.fulfill() } else { secondReady.fulfill() }
+        })
+        addTeardownBlock {
+            await withCheckedContinuation { continuation in
+                Task { @MainActor in service.stop { continuation.resume() } }
+            }
+            await MainActor.run { settings.flushSync() }
+            try? FileManager.default.removeItem(at: root)
+        }
         service.observeSetting()
         XCTAssertEqual(service.sessionID, "")
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("control.sock").path))
         settings.appSettings.externalControlEnabled = true
-        await nextMainTurn()
+        let firstResult = await XCTWaiter.fulfillment(of: [firstReady], timeout: 3)
+        XCTAssertEqual(firstResult, .completed)
+        XCTAssertNil(service.startupFailure)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("control.sock").path))
         let firstSession = service.sessionID
-        XCTAssertFalse(firstSession.isEmpty)
+        let (firstFD, firstHello) = try await socketHello(directory)
+        defer { close(firstFD) }
+        XCTAssertEqual(firstHello.object?["type"], .string("hello"))
+        XCTAssertEqual(firstHello.object?["sessionId"], .string(firstSession))
         settings.appSettings.externalControlEnabled = false
-        await nextMainTurn()
-        await withCheckedContinuation { continuation in server.stop { continuation.resume() } }
+        let firstClosed = await socketClosed(firstFD)
+        XCTAssertTrue(firstClosed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("control.sock").path))
         settings.appSettings.externalControlEnabled = true
-        await nextMainTurn()
+        let secondResult = await XCTWaiter.fulfillment(of: [secondReady], timeout: 3)
+        XCTAssertEqual(secondResult, .completed)
+        XCTAssertNil(service.startupFailure)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("control.sock").path))
         XCTAssertNotEqual(service.sessionID, firstSession)
-        await withCheckedContinuation { continuation in service.stop { continuation.resume() } }
+        let (secondFD, secondHello) = try await socketHello(directory)
+        defer { close(secondFD) }
+        XCTAssertEqual(secondHello.object?["sessionId"], .string(service.sessionID))
+        settings.appSettings.externalControlEnabled = false
+        let secondClosed = await socketClosed(secondFD)
+        XCTAssertTrue(secondClosed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("control.sock").path))
-        settings.flushSync()
-        try FileManager.default.removeItem(at: root)
+    }
+
+    private func socketHello(_ directory: URL) async throws -> (Int32, ControlJSON) {
+        try await Task.detached {
+            var address = sockaddr_un()
+            address.sun_family = sa_family_t(AF_UNIX)
+            address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+            let path = Array(directory.appendingPathComponent("control.sock").path.utf8) + [0]
+            guard path.count <= MemoryLayout.size(ofValue: address.sun_path) else { throw POSIXError(.ENAMETOOLONG) }
+            withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: path) }
+            let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+            guard fd >= 0 else { throw POSIXError(.ENFILE) }
+            do {
+                let result = withUnsafePointer(to: &address) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    }
+                }
+                guard result == 0 else { throw POSIXError(.ECONNREFUSED) }
+                var timeout = timeval(tv_sec: 2, tv_usec: 0)
+                guard setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0 else {
+                    throw POSIXError(.EINVAL)
+                }
+                var data = Data()
+                var byte: UInt8 = 0
+                while Darwin.read(fd, &byte, 1) == 1 {
+                    if byte == 10 { return (fd, try JSONDecoder().decode(ControlJSON.self, from: data)) }
+                    data.append(byte)
+                }
+                throw POSIXError(.ETIMEDOUT)
+            } catch { close(fd); throw error }
+        }.value
+    }
+
+    private func socketClosed(_ fd: Int32) async -> Bool {
+        await Task.detached {
+            var byte: UInt8 = 0
+            return Darwin.read(fd, &byte, 1) == 0
+        }.value
     }
 
     @MainActor

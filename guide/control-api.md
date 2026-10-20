@@ -19,8 +19,11 @@ override. There is no TCP/WebSocket port, authentication token, helper, or daemo
 The Control directory is owned by that user and mode 0700; the socket is 0600.
 FineTune rejects symlinks, foreign-owned API directories/files, and peers whose
 credentials cannot be verified as the same effective UID.
-The FineTune parent must not be group/world-writable; FineTune does not repair
-parent permissions.
+Application Support must belong to your user. Its canonical ancestors must belong
+to root or your user, and neither they nor the FineTune parent may be
+group/world-writable. FineTune never repairs parent permissions. After binding it
+verifies that the absolute socket and the validated directory identify the same
+inode; failed namespace verification cleans up the socket it actually created.
 
 A nonblocking exclusive lock on `Control/server.lock` prevents multiple listeners.
 FineTune never removes the lock file. With the lock held, it removes a stale socket,
@@ -47,7 +50,9 @@ The server speaks first:
 
 Check protocol/version before sending requests. Use the hello's sessionId on every
 request. Each request needs type, a nonempty string id (at most 128 UTF-8 bytes,
-never reused on that connection), sessionId, method and an object params. Additional
+unique among requests still awaiting a response on that connection), sessionId,
+method and an object params. Completed IDs are not retained and can be reused;
+connection-unique IDs (for example, a counter) are recommended. Additional
 fields are ignored. Requests are processed serially and responses remain ordered.
 
 ```json
@@ -157,7 +162,7 @@ policies can subsequently change defaults.
 Error codes: unknownMethod, staleSession, invalidParams, appNotFound, ambiguousApp,
 staleApp, deviceNotFound, unsupportedRouting, permissionDenied, commandFailed,
 internalError. Messages are for people; match codes, not messages. Invalid IDs,
-duplicate IDs, malformed envelopes and invalid framing close the connection.
+duplicate in-flight IDs, malformed envelopes and invalid framing close the connection.
 
 No toggle/step/batch commands, device-volume writes, EQ/boost editing, reset,
 audio transport/meters, Bluetooth control, generic RPC or network access in v1.

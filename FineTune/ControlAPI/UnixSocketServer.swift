@@ -13,7 +13,7 @@ final class UnixSocketServer: @unchecked Sendable {
         let reader: DispatchSourceRead
         let writer: DispatchSourceWrite
         var input = Data()
-        var output: [Data] = []
+        var output: [(data: Data, completed: @Sendable () -> Void)] = []
         var offset = 0
         var partialSince: TimeInterval?
         var writeProgress: TimeInterval?
@@ -37,6 +37,7 @@ final class UnixSocketServer: @unchecked Sendable {
     private var lockFD: Int32 = -1
     private var directoryFD: Int32 = -1
     private var socketIdentity: (dev_t, ino_t)?
+    private var boundSocketPath: String?
     private var acceptSource: DispatchSourceRead?
     private var timer: DispatchSourceTimer?
     private var clients: [UUID: Client] = [:]
@@ -90,10 +91,10 @@ final class UnixSocketServer: @unchecked Sendable {
         }
     }
 
-    func send(_ payload: Data, to id: UUID) {
+    func send(_ payload: Data, to id: UUID, completed: @escaping @Sendable () -> Void = {}) {
         queue.async {
             guard let client = self.clients[id] else { return }
-            let buffered = client.output.reduce(0) { $0 + $1.count } - client.offset
+            let buffered = client.output.reduce(0) { $0 + $1.data.count } - client.offset
             guard payload.count <= Self.maximumFrameBytes,
                   client.output.count < Self.maximumOutputFrames,
                   buffered + payload.count + 1 <= Self.maximumOutputBytes else {
@@ -101,7 +102,7 @@ final class UnixSocketServer: @unchecked Sendable {
                 self.closeClient(id)
                 return
             }
-            client.output.append(payload + Data([10]))
+            client.output.append((payload + Data([10]), completed))
             if client.writeProgress == nil { client.writeProgress = self.now() }
             self.writeClient(id)
         }
@@ -116,12 +117,47 @@ final class UnixSocketServer: @unchecked Sendable {
         ControlFailure(code: "listenerFailed", message: "\(message) (errno \(errno))")
     }
 
+    private func openValidatedSupport(_ support: URL) throws -> Int32 {
+        var fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard fd >= 0 else { throw failure("Cannot open filesystem root") }
+        do {
+            // Canonical ancestors may belong to root or this user, but none may
+            // let another user replace a component of the absolute bind path.
+            for component in ["/"] + support.pathComponents.dropFirst() {
+                if component != "/" {
+                    let next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                    guard next >= 0 else { throw failure("Cannot open socket path ancestor") }
+                    close(fd)
+                    fd = next
+                }
+                var info = stat()
+                guard fileStatus(fd, nil, &info) == 0,
+                      info.st_uid == 0 || info.st_uid == geteuid(), info.st_mode & 0o022 == 0 else {
+                    throw failure("Socket path ancestors must have trusted ownership and not be writable by others")
+                }
+            }
+            var info = stat()
+            guard fileStatus(fd, nil, &info) == 0, info.st_uid == geteuid() else {
+                throw failure("Application Support must belong to this user")
+            }
+            return fd
+        } catch {
+            close(fd)
+            throw error
+        }
+    }
+
     private func openListener() throws {
         // Open each API-owned path component without following symlinks. Never chmod parents.
         let parent = directory.deletingLastPathComponent()
-        let support = parent.deletingLastPathComponent()
-        let supportFD = open(support.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard supportFD >= 0 else { throw failure("Cannot open Application Support") }
+        // Foundation path standardization can preserve /var's symlink alias on macOS.
+        // realpath supplies the actual components for the no-follow traversal/bind.
+        guard let resolved = realpath(parent.deletingLastPathComponent().path, nil) else {
+            throw failure("Cannot resolve Application Support")
+        }
+        defer { free(resolved) }
+        let support = URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
+        let supportFD = try openValidatedSupport(support)
         defer { close(supportFD) }
         if mkdirat(supportFD, parent.lastPathComponent, 0o700) != 0 && errno != EEXIST {
             throw failure("Cannot create FineTune directory")
@@ -153,7 +189,9 @@ final class UnixSocketServer: @unchecked Sendable {
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
-        let path = Array(directory.appendingPathComponent("control.sock").path.utf8) + [0]
+        let socketPath = support.appendingPathComponent(parent.lastPathComponent)
+            .appendingPathComponent(directory.lastPathComponent).appendingPathComponent("control.sock").path
+        let path = Array(socketPath.utf8) + [0]
         guard path.count <= MemoryLayout.size(ofValue: address.sun_path) else { throw failure("Socket path is too long") }
         withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: path) }
         address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
@@ -167,10 +205,17 @@ final class UnixSocketServer: @unchecked Sendable {
             }
         }
         guard result == 0 else { throw failure("Cannot bind socket") }
-        guard fileStatus(directoryFD, "control.sock", &info) == 0 else {
-            throw failure("Cannot inspect bound socket")
+        // Record the actual absolute-path inode first, so a namespace mismatch
+        // can clean up what bind created rather than leave an uninspected socket.
+        guard lstat(socketPath, &info) == 0, info.st_uid == geteuid(), info.st_mode & S_IFMT == S_IFSOCK else {
+            throw failure("Cannot inspect absolute bound socket")
         }
         socketIdentity = (info.st_dev, info.st_ino)
+        boundSocketPath = socketPath
+        guard fileStatus(directoryFD, "control.sock", &info) == 0,
+              info.st_dev == socketIdentity?.0, info.st_ino == socketIdentity?.1 else {
+            throw failure("Cannot inspect bound socket")
+        }
         guard fchmodat(directoryFD, "control.sock", 0o600, AT_SYMLINK_NOFOLLOW) == 0,
               listen(listener, 8) == 0 else { throw failure("Cannot secure/listen on socket") }
         let source = DispatchSource.makeReadSource(fileDescriptor: listener, queue: queue)
@@ -262,8 +307,8 @@ final class UnixSocketServer: @unchecked Sendable {
     private func writeClient(_ id: UUID) {
         guard let client = clients[id] else { return }
         while let first = client.output.first {
-            let count = first.withUnsafeBytes { bytes in
-                Darwin.write(client.fd, bytes.baseAddress!.advanced(by: client.offset), first.count - client.offset)
+            let count = first.data.withUnsafeBytes { bytes in
+                Darwin.write(client.fd, bytes.baseAddress!.advanced(by: client.offset), first.data.count - client.offset)
             }
             if count < 0 {
                 if errno == EINTR { continue }
@@ -274,7 +319,11 @@ final class UnixSocketServer: @unchecked Sendable {
             guard count > 0 else { closeClient(id); return }
             client.offset += count
             client.writeProgress = now()
-            if client.offset == first.count { client.output.removeFirst(); client.offset = 0 }
+            if client.offset == first.data.count {
+                client.output.removeFirst()
+                client.offset = 0
+                first.completed()
+            }
         }
         client.writeProgress = nil
         if client.writerResumed { client.writer.suspend(); client.writerResumed = false }
@@ -311,8 +360,14 @@ final class UnixSocketServer: @unchecked Sendable {
                info.st_dev == identity.0, info.st_ino == identity.1 {
                 unlinkat(directoryFD, "control.sock", 0)
             }
+            if let path = boundSocketPath, lstat(path, &info) == 0,
+               info.st_uid == geteuid(), info.st_mode & S_IFMT == S_IFSOCK,
+               info.st_dev == identity.0, info.st_ino == identity.1 {
+                unlink(path)
+            }
         }
         socketIdentity = nil
+        boundSocketPath = nil
         if directoryFD >= 0 { close(directoryFD); directoryFD = -1 }
         if lockFD >= 0 { close(lockFD); lockFD = -1 }
         onConnect = nil

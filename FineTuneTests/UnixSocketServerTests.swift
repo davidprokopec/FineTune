@@ -8,6 +8,19 @@ private nonisolated final class SocketTestClock: @unchecked Sendable {
     func readAndAdvance() -> TimeInterval { lock.withLock { defer { value += 11 }; return value } }
 }
 
+private nonisolated final class SocketNamespaceSwap: @unchecked Sendable {
+    private let lock = NSLock()
+    private var performed = false
+
+    func once(_ action: () throws -> Void) rethrows {
+        try lock.withLock {
+            guard !performed else { return }
+            performed = true
+            try action()
+        }
+    }
+}
+
 nonisolated final class UnixSocketServerTests: XCTestCase {
     private func makeDirectory() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ft-" + UUID().uuidString.prefix(8))
@@ -270,7 +283,10 @@ nonisolated final class UnixSocketServerTests: XCTestCase {
             }
             let server = UnixSocketServer(directory: directory, fileStatus: { fd, name, info in
                 let result = UnixSocketServer.readFileStatus(fd, name, info)
-                if result == 0, !foreignSocket || name == "control.sock" { info.pointee.st_uid = geteuid() + 1 }
+                var parent = stat()
+                let isFineTune = lstat(directory.deletingLastPathComponent().path, &parent) == 0 &&
+                    parent.st_dev == info.pointee.st_dev && parent.st_ino == info.pointee.st_ino
+                if result == 0, foreignSocket ? name == "control.sock" : isFineTune { info.pointee.st_uid = geteuid() + 1 }
                 return result
             })
             let failed = expectation(description: "Foreign ownership refused")
@@ -327,5 +343,59 @@ nonisolated final class UnixSocketServerTests: XCTestCase {
         }.value
         XCTAssertEqual(count, payload.count)
         await fulfillment(of: [received], timeout: 3)
+    }
+
+    func testRejectsWritableApplicationSupportAndHigherAncestorWithoutRepair() async throws {
+        for higherAncestor in [false, true] {
+            let original = try makeDirectory()
+            let root = original.deletingLastPathComponent().deletingLastPathComponent()
+            let directory = higherAncestor ? root.appendingPathComponent("Support/FineTune/Control") : original
+            let support = directory.deletingLastPathComponent().deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+            let unsafe = higherAncestor ? root : support
+            XCTAssertEqual(chmod(unsafe.path, 0o777), 0)
+            let server = UnixSocketServer(directory: directory)
+            let failed = expectation(description: "Writable namespace ancestor refused")
+            server.start(onConnect: { _ in XCTFail() }, onFrame: { _, _, done in XCTFail(); done() },
+                         onDisconnect: { _ in }, onFailure: { message in
+                XCTAssertTrue(message.contains("ancestors"))
+                failed.fulfill()
+            })
+            await fulfillment(of: [failed], timeout: 3)
+            var info = stat()
+            XCTAssertEqual(lstat(unsafe.path, &info), 0)
+            XCTAssertEqual(info.st_mode & 0o777, 0o777)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("control.sock").path))
+        }
+    }
+
+    func testNamespaceSwapAfterValidationCleansActualBoundSocket() async throws {
+        let directory = try makeDirectory()
+        let parent = directory.deletingLastPathComponent()
+        let moved = parent.deletingLastPathComponent().appendingPathComponent("Moved")
+        let swap = SocketNamespaceSwap()
+        let server = UnixSocketServer(directory: directory, fileStatus: { fd, name, info in
+            let result = UnixSocketServer.readFileStatus(fd, name, info)
+            let savedErrno = errno
+            if name == "control.sock" {
+                do {
+                    try swap.once {
+                        try FileManager.default.moveItem(at: parent, to: moved)
+                        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    }
+                } catch { XCTFail("Cannot arrange namespace swap: \(error)") }
+            }
+            errno = savedErrno
+            return result
+        })
+        let failed = expectation(description: "Namespace mismatch refused")
+        server.start(onConnect: { _ in XCTFail() }, onFrame: { _, _, done in XCTFail(); done() },
+                     onDisconnect: { _ in }, onFailure: { message in
+            XCTAssertTrue(message.contains("inspect bound socket"))
+            failed.fulfill()
+        })
+        await fulfillment(of: [failed], timeout: 3)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("control.sock").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: moved.appendingPathComponent("Control/control.sock").path))
     }
 }
