@@ -11,13 +11,14 @@ private let logger = Logger(subsystem: "com.finetuneapp.FineTune", category: "Ap
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     var audioEngine: AudioEngine?
     var controlService: ControlService?
+    private let controlTermination = ControlTermination()
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let controlService else { return .terminateNow }
         // Allow queue-confined socket cleanup to finish without blocking the main actor.
-        controlService.stop {
-            DispatchQueue.main.async { NSApplication.shared.reply(toApplicationShouldTerminate: true) }
-        }
+        controlTermination.begin(stop: { controlService.stop(completion: $0) }, reply: {
+            NSApplication.shared.reply(toApplicationShouldTerminate: true)
+        })
         return .terminateLater
     }
 
